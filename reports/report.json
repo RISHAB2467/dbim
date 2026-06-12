@@ -1,0 +1,166 @@
+{
+  "url": "https://www.stqc.gov.in/",
+  "summary": {
+    "overall_compliance_pct": 17.6,
+    "total_checks": 17,
+    "passed": 3,
+    "failed": 14,
+    "grade": "F",
+    "status": "NON_COMPLIANT"
+  },
+  "results": [
+    {
+      "requirement": "F1-01",
+      "name": "Primary Colour Palette",
+      "status": "FAIL",
+      "reason": "No dominant primary colour group detected on the website.",
+      "actual": "UNKNOWN",
+      "expected": "Burgundy, Purple, Blue, Green, Chrome Yellow, Cinnamon Red",
+      "evidence": "screenshots/F1_01/primary_palette_001.png"
+    },
+    {
+      "requirement": "F1-02",
+      "name": "Functional Colour Palette",
+      "status": "PASS",
+      "reason": "No functional colour violations detected.",
+      "actual": "N/A",
+      "expected": "DBIM functional palette",
+      "evidence": "screenshots/F1_02/functional_palette_001.png"
+    },
+    {
+      "requirement": "F1-03",
+      "name": "Icon Colours",
+      "status": "FAIL",
+      "reason": "Icon uses colour #044A9F which is not the dominant key colour or #FFFFFF. Nearest approved: None (ΔE=999.0)",
+      "actual": "#044A9F",
+      "expected": "Dominant group colour or #FFFFFF",
+      "evidence": "screenshots/F1_03/icon_colour_violation_001.png"
+    },
+    {
+      "requirement": "F1-04",
+      "name": "Footer Background Colour",
+      "status": "FAIL",
+      "reason": "Footer background #000000 does not match dominant key colour None (ΔE=0.0).",
+      "actual": "#000000",
+      "expected": "Dominant key colour",
+      "evidence": "screenshots/F1_04/footer_001.png"
+    },
+    {
+      "requirement": "F1-05",
+      "name": "Consistent Icon Style",
+      "status": "PASS",
+      "reason": "Icon styles appear consistent: {'unknown': 2}.",
+      "actual": "{'unknown': 2}",
+      "expected": "Single consistent icon style",
+      "evidence": "screenshots/F1_05/icon_consistency_001.png"
+    },
+    {
+      "requirement": "F1-06",
+      "name": "DBIM Icon Set Usage",
+      "status": "FAIL",
+      "reason": "DBIM icon match: 22.2% (2/9). Custom/non-DBIM icons: ['topfb_icon ', 'bhashini-dropdown-btn-icon ', 'topfb_icon /sitemap', 'icon_s ', 'icon_s ']",
+      "actual": "22.2%",
+      "expected": ">=70% DBIM icon set",
+      "evidence": "screenshots/F1_06/dbim_icon_usage_001.png"
+    },
+    {
+      "requirement": "F1-07",
+      "name": "Icon File Format",
+      "status": "FAIL",
+      "reason": "Icon uses disallowed format '.jpg': https://www.stqc.gov.in/themes/stqc/images/leader1.jpg",
+      "actual": ".jpg",
+      "expected": "PNG, SVG, or WEBP",
+      "evidence": "screenshots/F1_07/format_violation_001.png"
+    },
+    {
+      "requirement": "F1-07",
+      "name": "Icon File Format",
+      "status": "FAIL",
+      "reason": "Icon uses disallowed format '.jpg': https://www.stqc.gov.in/sites/default/files/2024-08/railway_2.jpg",
+      "actual": ".jpg",
+      "expected": "PNG, SVG, or WEBP",
+      "evidence": "screenshots/F1_07/format_violation_001.png"
+    },
+    {
+      "requirement": "F1-08",
+      "name": "Icon Size",
+      "status": "FAIL",
+      "reason": "Icon rendered at 15x22px which is not a DBIM approved size.",
+      "actual": "15x22",
+      "expected": "24x24, 32x32, 48x48, or 64x64",
+      "evidence": "screenshots/F1_08/icon_size_violation_001.png"
+    },
+    {
+      "requirement": "F1-08",
+      "name": "Icon Size",
+      "status": "FAIL",
+      "reason": "Icon rendered at 20x19px which is not a DBIM approved size.",
+      "actual": "20x19",
+      "expected": "24x24, 32x32, 48x48, or 64x64",
+      "evidence": "screenshots/F1_08/icon_size_violation_001.png"
+    },
+    {
+      "requirement": "F1-08",
+      "name": "Icon Size",
+      "status": "FAIL",
+      "reason": "Icon rendered at 15x16px which is not a DBIM approved size.",
+      "actual": "15x16",
+      "expected": "24x24, 32x32, 48x48, or 64x64",
+      "evidence": "screenshots/F1_08/icon_size_violation_001.png"
+    },
+    {
+      "requirement": "F1-08",
+      "name": "Icon Size",
+      "status": "FAIL",
+      "reason": "Icon rendered at 49x78px which is not a DBIM approved size.",
+      "actual": "49x78",
+      "expected": "24x24, 32x32, 48x48, or 64x64",
+      "evidence": "screenshots/F1_08/icon_size_violation_001.png"
+    },
+    {
+      "requirement": "F1-08",
+      "name": "Icon Size",
+      "status": "FAIL",
+      "reason": "Icon rendered at 12x14px which is not a DBIM approved size.",
+      "actual": "12x14",
+      "expected": "24x24, 32x32, 48x48, or 64x64",
+      "evidence": "screenshots/F1_08/icon_size_violation_001.png"
+    },
+    {
+      "requirement": "F1-08",
+      "name": "Icon Size",
+      "status": "FAIL",
+      "reason": "Icon rendered at 20x22px which is not a DBIM approved size.",
+      "actual": "20x22",
+      "expected": "24x24, 32x32, 48x48, or 64x64",
+      "evidence": "screenshots/F1_08/icon_size_violation_001.png"
+    },
+    {
+      "requirement": "F1-08",
+      "name": "Icon Size",
+      "status": "FAIL",
+      "reason": "Icon rendered at 21x23px which is not a DBIM approved size.",
+      "actual": "21x23",
+      "expected": "24x24, 32x32, 48x48, or 64x64",
+      "evidence": "screenshots/F1_08/icon_size_violation_001.png"
+    },
+    {
+      "requirement": "F1-09",
+      "name": "Icon Aspect Ratio",
+      "status": "FAIL",
+      "reason": "Icon appears non-square: rendered 49x78 (ratio 0.627)",
+      "actual": "Ratio 0.627",
+      "expected": "1:1 (square)",
+      "evidence": "screenshots/F1_09/aspect_ratio_violation_001.png"
+    },
+    {
+      "requirement": "F1-10",
+      "name": "Icon Contrast on Images",
+      "status": "PASS",
+      "reason": "No icons detected over image/banner backgrounds.",
+      "actual": "N/A",
+      "expected": "Contrast ratio >= 4.5:1",
+      "evidence": "screenshots/F1_10/icon_contrast_001.png"
+    }
+  ]
+}
