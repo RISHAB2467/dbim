@@ -29,6 +29,8 @@ import subprocess
 import tempfile
 import os
 import random
+import ipaddress
+from functools import lru_cache
 
 import requests
 import webcolors
@@ -44,7 +46,7 @@ from bs4 import BeautifulSoup
 
 import cv2
 import imagehash
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 from playwright.async_api import async_playwright
 
@@ -53,6 +55,47 @@ from colormath.color_conversions import convert_color
 from colormath.color_diff import delta_e_cie2000
 
 nest_asyncio.apply()
+
+# =========================================================
+# CONFIGURATION - Centralized thresholds and settings
+# =========================================================
+
+class AuditConfig:
+    """Centralized configuration for all audit thresholds and settings."""
+    # Colour matching
+    DELTA_E_THRESHOLD = 15.0        # Max ΔE for "close enough" colour match
+    DELTA_E_EXACT = 2.0             # ΔE below this = visually identical
+    
+    # Accessibility
+    MIN_CONTRAST_RATIO = 4.5        # WCAG AA for normal text / icons
+    MIN_CONTRAST_LARGE = 3.0        # WCAG AA for large text
+    
+    # Icon constraints
+    MAX_ICON_DIM = 128              # Pixels — larger = not an icon
+    MIN_ICON_DIM = 8                # Pixels — smaller = decorative/spacer
+    ASPECT_RATIO_TOLERANCE = 0.01   # Ratio diff considered "same"
+    
+    # Palette detection
+    SECONDARY_RATIO_THRESHOLD = 0.4  # Above = palette inconsistency
+    
+    # Crawling
+    MAX_PAGES = 100
+    PAGE_TIMEOUT_MS = 30000
+    SCROLL_STEPS = 5
+    SCROLL_DELAY_MS = 400
+
+CONFIG = AuditConfig()
+
+# =========================================================
+# BLOCKED HOSTS FOR SSRF PROTECTION
+# =========================================================
+
+BLOCKED_HOSTS = {
+    "localhost", "127.0.0.1", "0.0.0.0",
+    "169.254.169.254",  # AWS metadata
+    "metadata.google.internal",  # GCP metadata
+    "metadata.cloudinit",  # cloud-init metadata
+}
 
 # =========================================================
 # PALETTES - OFFICIAL DBIM COLOURS
@@ -127,24 +170,95 @@ for _req in [f"F1_{i:02d}" for i in range(1, 11)]:
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
 # =========================================================
+# SSRF PROTECTION
+# =========================================================
+
+def is_safe_url(url: str):
+    """Return (is_safe, reason). Blocks SSRF targets."""
+    try:
+        parsed = urlparse(url)
+        host = parsed.hostname or ""
+
+        if host.lower() in BLOCKED_HOSTS:
+            return False, f"Blocked host: {host}"
+
+        # Block private IP ranges
+        try:
+            ip = ipaddress.ip_address(host)
+            if ip.is_private or ip.is_loopback or ip.is_link_local:
+                return False, f"Private/internal IP blocked: {host}"
+        except ValueError:
+            pass  # Not an IP address, hostname is OK
+
+        if parsed.scheme not in ("http", "https"):
+            return False, f"Only HTTP/HTTPS allowed, got: {parsed.scheme}"
+
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+# =========================================================
 # COLOUR UTILITIES
 # =========================================================
 
 def normalize_hex(color):
+    """Convert any CSS color value to uppercase hex string.
+    Returns None for transparent, inherited, or unparseable values."""
     if not color:
         return None
-    color = str(color).strip()
-    if color.lower() in ("transparent", "inherit", "unset", "none", "currentcolor", ""):
+
+    color = str(color).strip().lower()
+
+    # Skip non-color keywords
+    SKIP = {"transparent", "inherit", "unset", "none", "currentcolor",
+            "initial", "revert", "revert-layer", ""}
+    if color in SKIP:
         return None
+
     try:
+        # Already a hex value
         if color.startswith("#"):
             return webcolors.normalize_hex(color).upper()
-        if color.startswith("rgb"):
-            nums = re.findall(r"\d+", color)
-            r, g, b = int(nums[0]), int(nums[1]), int(nums[2])
+
+        # rgb() or rgba()
+        rgba_match = re.match(
+            r"rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)(?:\s*,\s*([\d.]+))?\s*\)",
+            color
+        )
+        if rgba_match:
+            r, g, b = int(rgba_match[1]), int(rgba_match[2]), int(rgba_match[3])
+            alpha = float(rgba_match[4]) if rgba_match[4] else 1.0
+            if alpha == 0:
+                return None  # Fully transparent
             return "#{:02X}{:02X}{:02X}".format(r, g, b)
+
+        # hsl() - convert to rgb first
+        hsl_match = re.match(
+            r"hsla?\(\s*([\d.]+)\s*,\s*([\d.]+)%\s*,\s*([\d.]+)%(?:\s*,\s*([\d.]+))?\s*\)",
+            color
+        )
+        if hsl_match:
+            h = float(hsl_match[1]) / 360
+            s = float(hsl_match[2]) / 100
+            l = float(hsl_match[3]) / 100
+            alpha = float(hsl_match[4]) if hsl_match[4] else 1.0
+            if alpha == 0:
+                return None
+            import colorsys
+            r, g, b = colorsys.hls_to_rgb(h, l, s)
+            return "#{:02X}{:02X}{:02X}".format(
+                int(r * 255), int(g * 255), int(b * 255)
+            )
+
+        # Named color (e.g., "red", "navy")
+        try:
+            return webcolors.name_to_hex(color).upper()
+        except (ValueError, AttributeError):
+            pass
+
     except Exception:
-        return None
+        pass
+
     return None
 
 
@@ -154,27 +268,50 @@ def hex_to_lab(hex_color):
     return convert_color(srgb, LabColor)
 
 
+# Pre-compute Lab values for approved colours
+_APPROVED_LAB = {}
+for _hex in ALL_APPROVED:
+    try:
+        _APPROVED_LAB[_hex] = hex_to_lab(_hex)
+    except Exception:
+        pass
+
+
 def delta_e(c1, c2):
     try:
         lab1 = hex_to_lab(c1)
         lab2 = hex_to_lab(c2)
         value = delta_e_cie2000(lab1, lab2)
-        if hasattr(value, "item"):
-            value = value.item()
+        # Handle numpy scalar, numpy array, or plain float
+        if isinstance(value, np.ndarray):
+            value = value.flat[0]
         return float(value)
     except Exception:
         return 999.0
 
 
+@lru_cache(maxsize=512)
 def nearest_approved_colour(color, threshold=15):
+    """Cached nearest colour lookup using pre-computed Lab values."""
     if color in ALL_APPROVED:
         return color, 0.0
+
+    color_lab = None
+    try:
+        color_lab = hex_to_lab(color)
+    except Exception:
+        return None, 999.0
+
     best, best_dist = None, 999.0
-    for approved in ALL_APPROVED:
-        d = delta_e(color, approved)
-        if d < best_dist:
-            best_dist = d
-            best = approved
+    for approved, approved_lab in _APPROVED_LAB.items():
+        try:
+            d = float(delta_e_cie2000(color_lab, approved_lab))
+            if d < best_dist:
+                best_dist = d
+                best = approved
+        except Exception:
+            continue
+
     if best_dist <= threshold:
         return best, best_dist
     return None, best_dist
@@ -221,7 +358,7 @@ def hex_to_rgb_tuple(hex_color):
         return (0, 0, 0)
 
 # =========================================================
-# SCREENSHOT HELPER
+# SCREENSHOT HELPER WITH ANNOTATION
 # =========================================================
 
 _screenshot_counters = defaultdict(int)
@@ -234,22 +371,190 @@ def _next_shot_path(req_id: str, label: str = "item") -> Path:
     return folder / f"{label}_{idx:03d}.png"
 
 
-async def capture_element_screenshot(page, selector: str, req_id: str, label: str = "violation") -> str:
-    path = _next_shot_path(req_id, label)
+def _safe_int(v):
     try:
-        el = page.locator(selector).first
-        await el.scroll_into_view_if_needed()
-        await el.evaluate(
-            "(el) => { el.style.outline = '3px solid red'; el.style.outlineOffset = '2px'; }"
-        )
-        await el.screenshot(path=str(path))
-        await el.evaluate("(el) => { el.style.outline = ''; el.style.outlineOffset = ''; }")
+        return int(round(float(v)))
     except Exception:
+        return 0
+
+
+async def capture_annotated_screenshot(
+    page,
+    req_id: str,
+    label: str,
+    rect: dict = None,
+    note: str = "",
+    selector: str = None,
+) -> str:
+    """
+    Capture a screenshot with a red box + label on the exact issue area.
+    If selector is provided, it will scroll that element into view and use
+    its bounding box. If rect is provided, it will annotate that rect.
+    """
+    path = _next_shot_path(req_id, label)
+
+    try:
+        # Resolve target rectangle
+        box = None
+
+        if selector:
+            try:
+                el = page.locator(selector).first
+                await el.scroll_into_view_if_needed()
+                box = await el.bounding_box()
+            except Exception:
+                box = None
+
+        if box:
+            rect = {
+                "x": box.get("x", 0),
+                "y": box.get("y", 0),
+                "width": box.get("width", 0),
+                "height": box.get("height", 0),
+            }
+
+        if not rect:
+            # fallback to plain screenshot if no coordinates are available
+            await page.screenshot(path=str(path), full_page=False)
+            return str(path)
+
+        x = _safe_int(rect.get("x", 0))
+        y = _safe_int(rect.get("y", 0))
+        w = max(1, _safe_int(rect.get("width", rect.get("w", 0))))
+        h = max(1, _safe_int(rect.get("height", rect.get("h", 0))))
+
+        # Scroll target into view if it appears off-screen
+        try:
+            await page.evaluate(
+                f"window.scrollTo({{ top: Math.max(0, {y} - 100), behavior: 'instant' }})"
+            )
+            await page.wait_for_timeout(300)
+        except Exception:
+            pass
+
+        # Re-fetch rect after scroll if we used a selector
+        if selector:
+            try:
+                el = page.locator(selector).first
+                box = await el.bounding_box()
+                if box:
+                    x = _safe_int(box.get("x", 0))
+                    y = _safe_int(box.get("y", 0))
+                    w = max(1, _safe_int(box.get("width", 0)))
+                    h = max(1, _safe_int(box.get("height", 0)))
+            except Exception:
+                pass
+
+        raw_path = path.with_name(path.stem + "_raw.png")
+        await page.screenshot(path=str(raw_path), full_page=False)
+
+        img = Image.open(raw_path).convert("RGBA")
+        draw = ImageDraw.Draw(img, "RGBA")
+        img_w, img_h = img.size
+
+        # Clamp coordinates to image bounds
+        x1 = max(0, min(img_w - 1, x))
+        y1 = max(0, min(img_h - 1, y))
+        x2 = max(0, min(img_w - 1, x + w))
+        y2 = max(0, min(img_h - 1, y + h))
+
+        # Ensure box is visible (minimum 4px)
+        if x2 - x1 < 4:
+            x2 = min(img_w - 1, x1 + 4)
+        if y2 - y1 < 4:
+            y2 = min(img_h - 1, y1 + 4)
+
+        # Red translucent highlight + thick border
+        draw.rectangle(
+            [x1, y1, x2, y2],
+            outline=(255, 0, 0, 255),
+            fill=(255, 0, 0, 45),
+            width=4,
+        )
+
+        # Add corner markers for extra visibility
+        marker_size = 8
+        for cx, cy in [(x1, y1), (x2, y1), (x1, y2), (x2, y2)]:
+            draw.rectangle(
+                [cx - marker_size, cy - marker_size, cx + marker_size, cy + marker_size],
+                fill=(255, 0, 0, 255),
+                outline=(255, 255, 255, 255),
+                width=2,
+            )
+
+        # Label with arrow
+        if note:
+            try:
+                font = ImageFont.truetype("arial.ttf", 18)
+            except Exception:
+                try:
+                    font = ImageFont.truetype("DejaVuSans-Bold.ttf", 18)
+                except Exception:
+                    font = ImageFont.load_default()
+
+            tb = draw.textbbox((0, 0), note, font=font)
+            tw = tb[2] - tb[0]
+            th = tb[3] - tb[1]
+
+            pad = 8
+            tx = x1
+            ty = max(0, y1 - th - 20)
+
+            # If label would go off top, place it below the box
+            if ty < 5:
+                ty = min(img_h - th - pad * 2 - 5, y2 + 10)
+
+            # If label would go off right, shift left
+            if tx + tw + pad * 2 > img_w:
+                tx = max(0, img_w - tw - pad * 2 - 2)
+
+            bg_box = [
+                tx, 
+                ty, 
+                min(img_w - 1, tx + tw + pad * 2), 
+                min(img_h - 1, ty + th + pad * 2)
+            ]
+            # White background with red border
+            draw.rectangle(bg_box, fill=(255, 255, 255, 240), outline=(255, 0, 0, 255), width=3)
+            draw.text((bg_box[0] + pad, bg_box[1] + pad), note, fill=(200, 0, 0, 255), font=font)
+
+            # Arrow from label to box
+            label_cx = (bg_box[0] + bg_box[2]) // 2
+            label_cy = bg_box[3] if ty < y1 else bg_box[1]
+            target_cx = (x1 + x2) // 2
+            target_cy = y1 if ty < y1 else y2
+
+            draw.line([(label_cx, label_cy), (target_cx, target_cy)], 
+                     fill=(255, 0, 0, 255), width=3)
+            
+            # Arrow head
+            import math
+            angle = math.atan2(target_cy - label_cy, target_cx - label_cx)
+            arrow_len = 12
+            ax1 = target_cx - arrow_len * math.cos(angle - math.pi / 6)
+            ay1 = target_cy - arrow_len * math.sin(angle - math.pi / 6)
+            ax2 = target_cx - arrow_len * math.cos(angle + math.pi / 6)
+            ay2 = target_cy - arrow_len * math.sin(angle + math.pi / 6)
+            draw.polygon(
+                [(target_cx, target_cy), (ax1, ay1), (ax2, ay2)],
+                fill=(255, 0, 0, 255),
+            )
+
+        img.save(str(path), "PNG")
+        try:
+            raw_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+        return str(path)
+
+    except Exception as e:
+        print(f"    [annotation error] {e}")
         try:
             await page.screenshot(path=str(path), full_page=False)
         except Exception:
             return ""
-    return str(path)
+        return str(path)
 
 
 async def capture_page_screenshot(page, req_id: str, label: str = "page") -> str:
@@ -260,6 +565,23 @@ async def capture_page_screenshot(page, req_id: str, label: str = "page") -> str
         return ""
     return str(path)
 
+
+async def capture_element_screenshot(page, selector: str, req_id: str, label: str = "violation") -> str:
+    """Legacy function - uses annotated screenshot now."""
+    try:
+        el = page.locator(selector).first
+        await el.scroll_into_view_if_needed()
+        box = await el.bounding_box()
+        if box:
+            return await capture_annotated_screenshot(
+                page, req_id, label,
+                rect=box,
+                note=label.replace("_", " ").title()
+            )
+    except Exception:
+        pass
+    return await capture_page_screenshot(page, req_id, label)
+
 # =========================================================
 # CRAWLING ENGINE
 # =========================================================
@@ -268,10 +590,23 @@ MAX_PAGES = 100
 
 
 def _same_domain(base_url: str, candidate: str) -> bool:
+    """Check if candidate is same domain or subdomain of base_url."""
     try:
-        base_host = urlparse(base_url).netloc
-        cand_host = urlparse(candidate).netloc
-        return base_host == cand_host
+        def root_domain(netloc: str) -> str:
+            # Strip port, strip www prefix
+            host = netloc.split(":")[0].lower()
+            if host.startswith("www."):
+                host = host[4:]
+            return host
+
+        base_root = root_domain(urlparse(base_url).netloc)
+        cand_root = root_domain(urlparse(candidate).netloc)
+
+        # Allow exact match OR subdomain of base
+        return (
+            cand_root == base_root
+            or cand_root.endswith("." + base_root)
+        )
     except Exception:
         return False
 
@@ -554,7 +889,7 @@ async def check_f1_01(page, url: str, colours: list, dominant_result: dict) -> d
         status = "FAIL"
         reason = f"Dominant colour group '{dg}' is not in the DBIM approved primary palette."
 
-    elif sec_ratio > 0.4:
+    elif sec_ratio > CONFIG.SECONDARY_RATIO_THRESHOLD:
         status = "FAIL"
         reason = (
             f"Dominant group '{dg}' (confidence {conf:.1%}) is significantly competing with "
@@ -567,7 +902,30 @@ async def check_f1_01(page, url: str, colours: list, dominant_result: dict) -> d
             f"Primary HEX: {key_hex}. Compliant."
         )
 
-    evidence = await capture_page_screenshot(page, "F1_01", "primary_palette")
+    # For F1-01, try to annotate the header/hero area which most represents the primary palette
+    if status == "FAIL":
+        # Try to annotate the most prominent element (header/hero)
+        try:
+            header_box = await page.evaluate("""
+                () => {
+                    const el = document.querySelector('header, .header, .hero, .banner, nav, .navbar');
+                    if (!el) return null;
+                    const rect = el.getBoundingClientRect();
+                    return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+                }
+            """)
+            if header_box:
+                evidence = await capture_annotated_screenshot(
+                    page, "F1_01", "primary_palette_violation",
+                    rect=header_box,
+                    note=f"Primary palette issue: {dg}"
+                )
+            else:
+                evidence = await capture_page_screenshot(page, "F1_01", "primary_palette")
+        except Exception:
+            evidence = await capture_page_screenshot(page, "F1_01", "primary_palette")
+    else:
+        evidence = await capture_page_screenshot(page, "F1_01", "primary_palette")
 
     return {
         "requirement": "F1-01",
@@ -903,7 +1261,40 @@ async def check_f1_02(page, url: str, colours: list) -> list:
     primary   = interactive[0] if len(interactive) > 0 else None
     secondary = interactive[1] if len(interactive) > 1 else None
 
-    evidence = await capture_page_screenshot(page, "F1_02", "functional_palette")
+    # Try to find and annotate a button/link with the primary functional color
+    if primary:
+        try:
+            primary_hex = primary['hex']
+            element_box = await page.evaluate(f"""
+                () => {{
+                    const targetHex = '{primary_hex}';
+                    const buttons = document.querySelectorAll('button, .btn, a, [role="button"]');
+                    for (const el of buttons) {{
+                        const style = getComputedStyle(el);
+                        const bg = style.backgroundColor;
+                        // Match against rgb format
+                        if (bg && bg !== 'rgba(0, 0, 0, 0)' && bg !== 'transparent') {{
+                            const rect = el.getBoundingClientRect();
+                            if (rect.width > 20 && rect.height > 20) {{
+                                return {{ x: rect.x, y: rect.y, width: rect.width, height: rect.height }};
+                            }}
+                        }}
+                    }}
+                    return null;
+                }}
+            """)
+            if element_box:
+                evidence = await capture_annotated_screenshot(
+                    page, "F1_02", "functional_palette",
+                    rect=element_box,
+                    note=f"Primary functional: {primary['hex']}"
+                )
+            else:
+                evidence = await capture_page_screenshot(page, "F1_02", "functional_palette")
+        except Exception:
+            evidence = await capture_page_screenshot(page, "F1_02", "functional_palette")
+    else:
+        evidence = await capture_page_screenshot(page, "F1_02", "functional_palette")
 
     if not primary and total_scanned == 0:
         return [{
@@ -1025,20 +1416,29 @@ async def check_f1_03(page, url: str, dominant_result: dict) -> list:
 
     for idx, icon in enumerate(icons[:30]):
         raw_colours = [icon.get("fill"), icon.get("stroke"), icon.get("color")]
-        detected = [normalize_hex(c) for c in raw_colours if normalize_hex(c)]
-        detected = [c for c in detected if c and c not in NEUTRALS or c == "#FFFFFF"]
+        # FIX: Use parentheses to fix operator precedence - allow #FFFFFF which is in NEUTRALS
+        detected = [c for c in raw_colours if c and (c not in NEUTRALS or c == "#FFFFFF")]
+        detected = [normalize_hex(c) for c in detected if normalize_hex(c)]
 
         if not detected:
             continue
 
         for c in detected:
-            if c == "none" or not c:
+            if not c:
                 continue
             nearest, dist = nearest_approved_colour(c)
             if nearest in approved_icon_colours or dist <= 10:
                 pass
             else:
-                evidence = await capture_page_screenshot(page, "F1_03", f"icon_colour_violation")
+                # Capture UNIQUE annotated screenshot for THIS specific violation
+                rect_data = icon.get("rect", {})
+                evidence = await capture_annotated_screenshot(
+                    page,
+                    "F1_03",
+                    f"icon_colour_violation_{idx + 1}",
+                    rect=rect_data,
+                    note=f"Wrong icon colour: {c}"
+                )
                 results.append({
                     "requirement": "F1-03",
                     "name": "Icon Colours",
@@ -1073,96 +1473,423 @@ async def check_f1_04(page, url: str, dominant_result: dict) -> dict:
     dominant_palette = PRIMARY_GROUPS.get(dominant_group, [])
     key_colour = dominant_palette[0] if dominant_palette else None
 
+    # STEP 1: Aggressive multi-pass scrolling to force-render lazy footers
+    try:
+        await page.evaluate("""
+            async () => {
+                // Multi-pass scroll: top -> bottom -> bottom again
+                window.scrollTo(0, 0);
+                await new Promise(r => setTimeout(r, 300));
+
+                const totalHeight = Math.max(
+                    document.body.scrollHeight,
+                    document.documentElement.scrollHeight
+                );
+                const step = window.innerHeight;
+                for (let y = 0; y < totalHeight; y += step) {
+                    window.scrollTo(0, y);
+                    await new Promise(r => setTimeout(r, 200));
+                }
+
+                // Final settle at very bottom
+                window.scrollTo(0, document.body.scrollHeight);
+                await new Promise(r => setTimeout(r, 500));
+                window.scrollTo(0, document.body.scrollHeight);
+                await new Promise(r => setTimeout(r, 500));
+            }
+        """)
+        await page.wait_for_timeout(1000)
+    except Exception:
+        pass
+
+    # STEP 2: Multi-strategy footer detection (semantic -> class/id -> text-based -> bottom-element)
     footer_data = await page.evaluate(
         """
         () => {
+            // ============================================================
+            // FOOTER KEYWORDS - very broad list for text-based detection
+            // ============================================================
+            const FOOTER_KEYWORDS = [
+                'useful links', 'quick links', 'related links', 'important links',
+                'archives', 'archive',
+                'contact us', 'contact', 'get in touch', 'reach us',
+                'sitemap', 'site map', 'site-map',
+                'last updated', 'last modified', 'page last updated', 'last reviewed',
+                'copyright', '©', '(c)',
+                'all rights reserved',
+                'privacy policy', 'terms of use', 'terms and conditions',
+                'disclaimer', 'hyperlinking policy',
+                'help', 'accessibility', 'accessibility statement',
+                'follow us', 'social media', 'connect with us',
+                'powered by', 'designed by', 'developed by', 'maintained by',
+                'nic', 'national informatics centre',
+                'visitor count', 'visitors', 'total visitors',
+                'feedback', 'rti', 'right to information',
+                'website policies', 'web information manager'
+            ];
 
-            function getBottomVisibleBackground() {
+            // ============================================================
+            // HELPER: parse rgb()/rgba() to uppercase hex
+            // ============================================================
+            function rgbToHexLocal(rgb) {
+                if (!rgb) return null;
+                if (rgb === 'transparent' || rgb === 'rgba(0, 0, 0, 0)') return null;
+                const m = rgb.match(/rgba?\\((\\d+),\\s*(\\d+),\\s*(\\d+)(?:,\\s*([\\d.]+))?\\)/);
+                if (!m) return null;
+                const a = m[4] !== undefined ? parseFloat(m[4]) : 1;
+                if (a === 0) return null;
+                const r = parseInt(m[1]), g = parseInt(m[2]), b = parseInt(m[3]);
+                return '#' + [r, g, b].map(v => v.toString(16).padStart(2, '0')).join('').toUpperCase();
+            }
 
-                const viewportHeight = window.innerHeight;
-                const x = window.innerWidth / 2;
-                const y = viewportHeight - 5;
+            function isNearWhite(hex) {
+                if (!hex) return true;
+                const r = parseInt(hex.slice(1, 3), 16);
+                const g = parseInt(hex.slice(3, 5), 16);
+                const b = parseInt(hex.slice(5, 7), 16);
+                return (r > 240 && g > 240 && b > 240);
+            }
 
-                let el = document.elementFromPoint(x, y);
-                if (!el) return null;
-
-                while (el) {
-                    const style = getComputedStyle(el);
-                    const bg = style.backgroundColor;
-
-                    if (bg &&
-                        bg !== 'transparent' &&
-                        bg !== 'rgba(0, 0, 0, 0)' &&
-                        bg !== 'rgba(0,0,0,0)') {
-                        return bg;
-                    }
-
-                    el = el.parentElement;
+            function countFooterKeywords(el) {
+                if (!el) return 0;
+                const text = (el.innerText || '').toLowerCase();
+                if (text.length < 5) return 0;
+                let hits = 0;
+                for (const kw of FOOTER_KEYWORDS) {
+                    if (text.includes(kw)) hits++;
                 }
+                return hits;
+            }
 
+            // Walk up element to find its first non-transparent visible background
+            function getEffectiveBg(el) {
+                let cur = el;
+                let depth = 0;
+                while (cur && depth < 6) {
+                    const style = window.getComputedStyle(cur);
+                    const bg = style.backgroundColor;
+                    const hex = rgbToHexLocal(bg);
+                    if (hex) {
+                        return { hex: hex, sourceEl: cur, sourceTag: cur.tagName.toLowerCase() };
+                    }
+                    cur = cur.parentElement;
+                    depth++;
+                }
                 return null;
             }
 
-            const bg = getBottomVisibleBackground();
-            return { backgroundColor: bg };
+            // ============================================================
+            // STRATEGY 1: Try semantic and common class/id selectors
+            // ============================================================
+            const SELECTORS = [
+                'footer[role="contentinfo"]',
+                'footer',
+                '[role="contentinfo"]',
+                '#footer',
+                '.footer',
+                '.site-footer',
+                '.page-footer',
+                '.main-footer',
+                '.footer-wrapper',
+                '.footer-section',
+                '.footer-container',
+                '.footer-area',
+                '.footer-content',
+                '.bottom-footer',
+                '.global-footer',
+                '#site-footer',
+                '#main-footer',
+                '#footer-wrapper',
+                '[class*="footer"]',
+                '[id*="footer"]',
+                '[class*="Footer"]',
+                '[id*="Footer"]'
+            ];
+
+            const docHeight = Math.max(
+                document.body.scrollHeight,
+                document.documentElement.scrollHeight
+            );
+
+            const candidates = [];
+            const seenElements = new Set();
+
+            for (const sel of SELECTORS) {
+                let elList = [];
+                try {
+                    elList = document.querySelectorAll(sel);
+                } catch (e) { continue; }
+
+                for (const el of elList) {
+                    if (seenElements.has(el)) continue;
+                    seenElements.add(el);
+
+                    const rect = el.getBoundingClientRect();
+                    const absTop = rect.top + window.scrollY;
+                    const absBottom = rect.bottom + window.scrollY;
+
+                    if (rect.width < 100 || rect.height < 20) continue;
+                    if (rect.height > 5000) continue;
+
+                    candidates.push({
+                        el: el,
+                        selector: sel,
+                        strategy: 'semantic',
+                        rect: rect,
+                        absTop: absTop,
+                        absBottom: absBottom,
+                        keywordHits: countFooterKeywords(el)
+                    });
+                }
+            }
+
+            // ============================================================
+            // STRATEGY 2: Text-based search - find any container holding
+            // multiple footer keywords (works for custom <div> footers)
+            // ============================================================
+            const allContainers = document.querySelectorAll(
+                'div, section, aside, nav, ul, table'
+            );
+            for (const el of allContainers) {
+                if (seenElements.has(el)) continue;
+
+                const rect = el.getBoundingClientRect();
+                if (rect.width < 200 || rect.height < 30) continue;
+                if (rect.height > 5000) continue;
+
+                const absBottom = rect.bottom + window.scrollY;
+                // Must be in bottom half of document
+                if (absBottom < docHeight * 0.5) continue;
+
+                const hits = countFooterKeywords(el);
+                if (hits >= 2) {
+                    seenElements.add(el);
+                    candidates.push({
+                        el: el,
+                        selector: el.tagName.toLowerCase() +
+                                  (el.id ? '#' + el.id : '') +
+                                  (el.className && typeof el.className === 'string'
+                                      ? '.' + el.className.trim().split(/\\s+/).slice(0, 2).join('.')
+                                      : ''),
+                        strategy: 'text-keyword',
+                        rect: rect,
+                        absTop: rect.top + window.scrollY,
+                        absBottom: absBottom,
+                        keywordHits: hits
+                    });
+                }
+            }
+
+            // ============================================================
+            // STRATEGY 3: Bottom-of-page fallback. Walk up from the
+            // last visible element to find an enclosing container with
+            // meaningful height and a coloured background.
+            // ============================================================
+            if (candidates.length === 0) {
+                window.scrollTo(0, docHeight);
+                const x = window.innerWidth / 2;
+                const y = Math.min(window.innerHeight - 10, docHeight - 10);
+                let el = document.elementFromPoint(x, y);
+                let depth = 0;
+                while (el && depth < 10) {
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width > 300 && rect.height > 60 && rect.height < 3000) {
+                        candidates.push({
+                            el: el,
+                            selector: 'bottom-fallback:' + el.tagName.toLowerCase(),
+                            strategy: 'bottom-fallback',
+                            rect: rect,
+                            absTop: rect.top + window.scrollY,
+                            absBottom: rect.bottom + window.scrollY,
+                            keywordHits: countFooterKeywords(el)
+                        });
+                        break;
+                    }
+                    el = el.parentElement;
+                    depth++;
+                }
+            }
+
+            if (candidates.length === 0) {
+                return { found: false, reason: 'No footer candidates from any strategy' };
+            }
+
+            // ============================================================
+            // SCORE all candidates and pick the best
+            // ============================================================
+            let best = null;
+            let bestScore = -Infinity;
+
+            for (const c of candidates) {
+                const bgInfo = getEffectiveBg(c.el);
+                let score = 0;
+
+                // Keyword hits dominate the score
+                score += c.keywordHits * 40;
+
+                // Position: closer to the bottom = better
+                const distFromBottom = docHeight - c.absBottom;
+                if (distFromBottom < 50)  score += 60;
+                else if (distFromBottom < 200) score += 40;
+                else if (distFromBottom < docHeight * 0.2) score += 25;
+                else if (distFromBottom < docHeight * 0.4) score += 10;
+
+                // Semantic <footer> tag bonus
+                if (c.el.tagName && c.el.tagName.toLowerCase() === 'footer') score += 50;
+
+                // Bonus for class/id containing "footer"
+                const idCls = ((c.el.id || '') + ' ' + (typeof c.el.className === 'string' ? c.el.className : '')).toLowerCase();
+                if (idCls.includes('footer')) score += 30;
+
+                // Non-white background bonus
+                if (bgInfo && !isNearWhite(bgInfo.hex)) score += 35;
+
+                // Reasonable height bonus
+                if (c.rect.height >= 100 && c.rect.height <= 1500) score += 15;
+
+                // Penalty if very tiny
+                if (c.rect.height < 50) score -= 30;
+
+                // Strategy bonus (semantic > text > fallback)
+                if (c.strategy === 'semantic') score += 10;
+                else if (c.strategy === 'text-keyword') score += 20;
+                else if (c.strategy === 'bottom-fallback') score -= 10;
+
+                if (score > bestScore) {
+                    bestScore = score;
+                    best = { candidate: c, bgInfo: bgInfo, score: score };
+                }
+            }
+
+            if (!best) {
+                return { found: false, reason: 'No candidate could be scored' };
+            }
+
+            // If chosen element has no usable bg, try a child with a real bg
+            if (!best.bgInfo) {
+                const inner = best.candidate.el.querySelectorAll('*');
+                for (const child of inner) {
+                    const childBg = getEffectiveBg(child);
+                    if (childBg && !isNearWhite(childBg.hex)) {
+                        best.bgInfo = childBg;
+                        break;
+                    }
+                }
+            }
+
+            // Scroll the chosen footer into view so the screenshot captures it
+            try {
+                best.candidate.el.scrollIntoView({ block: 'center', behavior: 'instant' });
+            } catch (e) {
+                try { best.candidate.el.scrollIntoView(); } catch (e2) {}
+            }
+
+            const finalRect = best.candidate.el.getBoundingClientRect();
+
+            return {
+                found: true,
+                backgroundColor: best.bgInfo ? best.bgInfo.hex : null,
+                selector: best.candidate.selector,
+                strategy: best.candidate.strategy,
+                keywordHits: best.candidate.keywordHits,
+                score: best.score,
+                candidateCount: candidates.length,
+                rect: {
+                    x: finalRect.x,
+                    y: finalRect.y,
+                    width: finalRect.width,
+                    height: finalRect.height
+                }
+            };
         }
         """
     )
 
-    if not footer_data:
+    await page.wait_for_timeout(600)
+
+    if not footer_data or not footer_data.get("found"):
+        evidence = await capture_page_screenshot(page, "F1_04", "footer_not_found")
+        reason_extra = ""
+        if footer_data:
+            reason_extra = f" ({footer_data.get('reason', 'unknown')})"
         return {
             "requirement": "F1-04",
             "name": "Footer Background Colour",
             "status": "FAIL",
-            "reason": "Could not detect footer background.",
+            "reason": (
+                "Could not detect any footer-like region on the page after "
+                "scrolling, semantic search, text-keyword search, and "
+                "bottom-element fallback." + reason_extra
+            ),
             "actual": "N/A",
             "expected": key_colour,
-            "evidence": "",
+            "evidence": evidence,
         }
 
     bg = normalize_hex(footer_data.get("backgroundColor"))
-    evidence = await capture_page_screenshot(page, "F1_04", "footer_detected")
+    rect_data = footer_data.get("rect")
+    strategy = footer_data.get("strategy", "unknown")
+    selector_used = footer_data.get("selector", "unknown")
+    kw_hits = footer_data.get("keywordHits", 0)
+    score = footer_data.get("score", 0)
+    cand_count = footer_data.get("candidateCount", 0)
 
+    debug_suffix = (
+        f" [strategy={strategy}, selector='{selector_used}', "
+        f"keywords={kw_hits}, score={score}, candidates_evaluated={cand_count}]"
+    )
+
+    # Determine pass/fail
     if not bg:
-        return {
-            "requirement": "F1-04",
-            "name": "Footer Background Colour",
-            "status": "FAIL",
-            "reason": "Footer background colour could not be determined.",
-            "actual": str(footer_data.get("backgroundColor")),
-            "expected": key_colour,
-            "evidence": evidence,
-        }
+        status = "FAIL"
+        reason = (
+            "Footer region was located but no usable background colour could be parsed."
+            + debug_suffix
+        )
+        actual = "no-bg"
+    elif bg == key_colour:
+        status = "PASS"
+        reason = f"Footer background {bg} matches dominant key colour {key_colour}." + debug_suffix
+        actual = bg
+    else:
+        dist = delta_e(bg, key_colour) if key_colour else 999
+        if dist <= CONFIG.DELTA_E_THRESHOLD:
+            status = "PASS"
+            reason = (
+                f"Footer background {bg} is visually equivalent to {key_colour} "
+                f"(ΔE={dist:.1f})." + debug_suffix
+            )
+            actual = bg
+        else:
+            status = "FAIL"
+            reason = (
+                f"Footer background {bg} does not match dominant key colour {key_colour}."
+                + debug_suffix
+            )
+            actual = bg
 
-    if bg == key_colour:
-        return {
-            "requirement": "F1-04",
-            "name": "Footer Background Colour",
-            "status": "PASS",
-            "reason": f"Footer background {bg} matches dominant key colour {key_colour}.",
-            "actual": bg,
-            "expected": key_colour,
-            "evidence": evidence,
-        }
+    # Annotate ONLY the actual footer bounding box
+    note_text = f"Footer BG: {bg if bg else 'unknown'}"
+    if status == "FAIL" and key_colour and bg:
+        note_text = f"Wrong Footer BG: {bg} (expected {key_colour})"
+    elif status == "FAIL":
+        note_text = f"Footer detected but BG unreadable"
 
-    dist = delta_e(bg, key_colour)
-    if dist <= 15:
-        return {
-            "requirement": "F1-04",
-            "name": "Footer Background Colour",
-            "status": "PASS",
-            "reason": f"Footer background {bg} is visually equivalent to {key_colour} (ΔE={dist:.1f}).",
-            "actual": bg,
-            "expected": key_colour,
-            "evidence": evidence,
-        }
+    if rect_data and rect_data.get("width", 0) > 0 and rect_data.get("height", 0) > 0:
+        evidence = await capture_annotated_screenshot(
+            page, "F1_04", "footer_detected",
+            rect=rect_data,
+            note=note_text
+        )
+    else:
+        evidence = await capture_page_screenshot(page, "F1_04", "footer_detected")
 
     return {
         "requirement": "F1-04",
         "name": "Footer Background Colour",
-        "status": "FAIL",
-        "reason": f"Footer background {bg} does not match dominant key colour {key_colour}.",
-        "actual": bg,
+        "status": status,
+        "reason": reason,
+        "actual": actual,
         "expected": key_colour,
         "evidence": evidence,
     }
@@ -1204,6 +1931,7 @@ async def check_f1_05(page, url: str) -> dict:
         }
 
     style_counts = defaultdict(int)
+    style_examples = defaultdict(list)
     style_patterns = {
         "outline": ["outline", "-o-", "-regular"],
         "filled": ["filled", "solid", "-fill", "-fas"],
@@ -1220,16 +1948,28 @@ async def check_f1_05(page, url: str) -> dict:
         for style_name, patterns in style_patterns.items():
             if any(p in combined for p in patterns):
                 style_counts[style_name] += 1
+                style_examples[style_name].append(icon)
                 matched = True
                 break
         if not matched:
             style_counts["unknown"] += 1
+            style_examples["unknown"].append(icon)
 
-    evidence = await capture_page_screenshot(page, "F1_05", "icon_consistency")
     dominant_styles = [k for k, v in style_counts.items() if v > 0 and k != "unknown"]
     mixed = len(dominant_styles) > 1
 
     if mixed:
+        # Find an icon from the less common style to annotate
+        sorted_styles = sorted(dominant_styles, key=lambda k: style_counts[k])
+        less_common_style = sorted_styles[0]
+        example_icon = style_examples[less_common_style][0]
+        
+        evidence = await capture_annotated_screenshot(
+            page, "F1_05", "icon_style_mixed",
+            rect=example_icon.get("rect"),
+            note=f"Inconsistent style: {less_common_style}"
+        )
+        
         return {
             "requirement": "F1-05",
             "name": "Consistent Icon Style",
@@ -1240,6 +1980,7 @@ async def check_f1_05(page, url: str) -> dict:
             "evidence": evidence,
         }
 
+    evidence = await capture_page_screenshot(page, "F1_05", "icon_consistency")
     return {
         "requirement": "F1-05",
         "name": "Consistent Icon Style",
@@ -1275,7 +2016,8 @@ async def check_f1_06(page, url: str) -> dict:
                     tag: el.tagName,
                     className: cls,
                     src: src,
-                    href: href
+                    href: href,
+                    rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height }
                 });
             });
 
@@ -1284,9 +2026,8 @@ async def check_f1_06(page, url: str) -> dict:
         """
     )
 
-    evidence = await capture_page_screenshot(page, "F1_06", "dbim_icon_usage")
-
     if not icon_data:
+        evidence = await capture_page_screenshot(page, "F1_06", "dbim_icon_usage")
         return {
             "requirement": "F1-06",
             "name": "DBIM Icon Set Usage",
@@ -1311,6 +2052,7 @@ async def check_f1_06(page, url: str) -> dict:
 
     non_dbim_count = 0
     non_dbim_list = []
+    non_dbim_examples = []
 
     for icon in icon_data:
         combined = (
@@ -1319,9 +2061,12 @@ async def check_f1_06(page, url: str) -> dict:
             (icon.get("href", "") or "")
         ).lower()
 
-        if any(pattern in combined for pattern in NON_DBIM_PATTERNS):
-            non_dbim_count += 1
-            non_dbim_list.append(combined[:80])
+        for pattern in NON_DBIM_PATTERNS:
+            if pattern in combined:
+                non_dbim_count += 1
+                non_dbim_list.append(combined[:80])
+                non_dbim_examples.append({"icon": icon, "pattern": pattern.strip()})
+                break
 
     if non_dbim_count == 0:
         status = "PASS"
@@ -1331,6 +2076,7 @@ async def check_f1_06(page, url: str) -> dict:
             f"Icons likely sourced from DBIM Toolkit or custom government set."
         )
         actual = "No external libraries detected"
+        evidence = await capture_page_screenshot(page, "F1_06", "dbim_icon_usage")
 
     else:
         match_pct = ((total - non_dbim_count) / total) * 100
@@ -1341,12 +2087,20 @@ async def check_f1_06(page, url: str) -> dict:
                 f"{match_pct:.1f}% of icons do not match known external libraries. "
                 f"Minor usage of non‑DBIM icons detected."
             )
+            evidence = await capture_page_screenshot(page, "F1_06", "dbim_icon_usage")
         else:
             status = "FAIL"
             reason = (
                 f"Significant usage of external icon libraries detected "
                 f"({non_dbim_count}/{total}). "
                 f"Examples: {non_dbim_list[:3]}"
+            )
+            # Annotate first non-DBIM icon example
+            example = non_dbim_examples[0]
+            evidence = await capture_annotated_screenshot(
+                page, "F1_06", "non_dbim_icon",
+                rect=example["icon"].get("rect"),
+                note=f"Non-DBIM icon: {example['pattern']}"
             )
 
         actual = f"{match_pct:.1f}% likely DBIM"
@@ -1375,7 +2129,14 @@ async def check_f1_07(page, url: str) -> list:
             document.querySelectorAll('img').forEach(el => {
                 const rect = el.getBoundingClientRect();
                 if (rect.width > 0 && rect.height > 0 && rect.width <= 128 && rect.height <= 128) {
-                    srcs.push({ src: el.src || "", alt: el.alt || "", width: rect.width, height: rect.height });
+                    srcs.push({ 
+                        src: el.src || "", 
+                        alt: el.alt || "", 
+                        width: rect.width, 
+                        height: rect.height, 
+                        x: rect.x, 
+                        y: rect.y 
+                    });
                 }
             });
             return srcs;
@@ -1402,11 +2163,24 @@ async def check_f1_07(page, url: str) -> list:
             continue
         ext = src.split("?")[0].rsplit(".", 1)[-1].lower()
         if ext in DISALLOWED_ICON_FORMATS:
-            violations.append({"src": src, "ext": ext})
+            violations.append({"src": src, "ext": ext, "icon": icon})
 
     if violations:
-        evidence = await capture_page_screenshot(page, "F1_07", "format_violation")
-        for v in violations[:10]:
+        for i, v in enumerate(violations[:10], start=1):
+            icon = v["icon"]
+            rect_data = {
+                "x": icon.get("x", 0),
+                "y": icon.get("y", 0),
+                "width": icon.get("width", 0),
+                "height": icon.get("height", 0)
+            }
+            evidence = await capture_annotated_screenshot(
+                page,
+                "F1_07",
+                f"format_violation_{v['ext']}_{i}",
+                rect=rect_data,
+                note=f"Disallowed format: .{v['ext']}"
+            )
             results.append({
                 "requirement": "F1-07",
                 "name": "Icon File Format",
@@ -1460,7 +2234,9 @@ async def check_f1_08(page, url: str) -> list:
 
                 icons.push({
                     renderedWidth: Math.round(rect.width),
-                    renderedHeight: Math.round(rect.height)
+                    renderedHeight: Math.round(rect.height),
+                    x: rect.x,
+                    y: rect.y
                 });
             });
 
@@ -1469,9 +2245,8 @@ async def check_f1_08(page, url: str) -> list:
         """
     )
 
-    evidence = await capture_page_screenshot(page, "F1_08", "icon_size")
-
     if not icon_data:
+        evidence = await capture_page_screenshot(page, "F1_08", "icon_size")
         return [{
             "requirement": "F1-08",
             "name": "Icon Size",
@@ -1496,21 +2271,41 @@ async def check_f1_08(page, url: str) -> list:
         )
 
         if not matched:
-            violations.append((w, h))
+            violations.append(icon)
 
     if violations:
-        unique = list(set(violations))[:10]
+        # Group by unique size and capture annotated screenshot for each unique violation
+        unique_sizes = list({(v["renderedWidth"], v["renderedHeight"]) for v in violations})[:10]
 
-        return [{
-            "requirement": "F1-08",
-            "name": "Icon Size",
-            "status": "FAIL",
-            "reason": "Some UI icons are not in approved DBIM sizes.",
-            "actual": ", ".join([f"{w}x{h}" for w, h in unique]),
-            "expected": "24x24, 32x32, 48x48, or 64x64",
-            "evidence": evidence,
-        }]
+        for i, (w, h) in enumerate(unique_sizes, start=1):
+            # Find first violation with this size
+            v = next(v for v in violations if v["renderedWidth"] == w and v["renderedHeight"] == h)
+            rect_data = {
+                "x": v["x"], 
+                "y": v["y"], 
+                "width": v["renderedWidth"], 
+                "height": v["renderedHeight"]
+            }
+            evidence = await capture_annotated_screenshot(
+                page,
+                "F1_08",
+                f"size_violation_{w}x{h}_{i}",
+                rect=rect_data,
+                note=f"Wrong size: {w}x{h}px"
+            )
+            results.append({
+                "requirement": "F1-08",
+                "name": "Icon Size",
+                "status": "FAIL",
+                "reason": f"Icon at ({v['x']:.0f}, {v['y']:.0f}) has non-DBIM size {w}x{h}px.",
+                "actual": f"{w}x{h}",
+                "expected": "24x24, 32x32, 48x48, or 64x64",
+                "evidence": evidence,
+            })
 
+        return results
+
+    evidence = await capture_page_screenshot(page, "F1_08", "icon_size_pass")
     return [{
         "requirement": "F1-08",
         "name": "Icon Size",
@@ -1523,24 +2318,15 @@ async def check_f1_08(page, url: str) -> list:
 
 # =========================================================
 # F1-09: ICON ASPECT RATIO
-# Manual Requirement:
-#   "The correct proportion of icon is retained and icon
-#    is not compressed or stretched"
-#
-# Logic (binary - matches manual exactly):
-#   PASS = proportion retained (not compressed/stretched)
-#   FAIL = proportion not retained (compressed/stretched)
-#
-# An icon's proportion IS RETAINED if ANY of these is true:
-#   1. object-fit: contain / cover / scale-down / none
-#      (browser preserves aspect ratio automatically)
-#   2. SVG without preserveAspectRatio="none"
-#      (SVG default behavior preserves aspect ratio)
-#   3. Rendered ratio matches intrinsic ratio
-#      (rounded to 2 decimal places to ignore sub-pixel rendering)
 # =========================================================
 
 async def check_f1_09(page, url: str) -> list:
+    """
+    F1-09: ICON ASPECT RATIO
+    Manual Requirement:
+        'The correct proportion of icon is retained and icon
+         is not compressed or stretched'
+    """
     results = []
 
     try:
@@ -1593,6 +2379,8 @@ async def check_f1_09(page, url: str) -> list:
                             svgPreserveAR:  svgPreserveAR,
                             cssWidth:       style.width  || '',
                             cssHeight:      style.height || '',
+                            x:              rect.x,
+                            y:              rect.y
                         });
                     } catch(e) {}
                 });
@@ -1638,9 +2426,7 @@ async def check_f1_09(page, url: str) -> list:
 
         rendered_ratio = rw / rh
 
-        # ═══════════════════════════════════════════════════════════
         # RULE 1: object-fit guarantees proportion is retained
-        # ═══════════════════════════════════════════════════════════
         if object_fit in ("contain", "cover", "scale-down", "none"):
             passed.append({
                 **icon,
@@ -1648,10 +2434,7 @@ async def check_f1_09(page, url: str) -> list:
             })
             continue
 
-        # ═══════════════════════════════════════════════════════════
         # RULE 2: SVG default behavior preserves aspect ratio
-        # (unless preserveAspectRatio="none" is explicitly set)
-        # ═══════════════════════════════════════════════════════════
         if tag == "svg":
             svg_par = icon.get("svgPreserveAR", "").strip().lower()
             if svg_par != "none":
@@ -1661,17 +2444,13 @@ async def check_f1_09(page, url: str) -> list:
                 })
                 continue
 
-        # ═══════════════════════════════════════════════════════════
         # RULE 3: Compare intrinsic vs rendered ratio
-        # ═══════════════════════════════════════════════════════════
         nw = icon.get("naturalWidth",  0) or icon.get("viewBoxWidth",  0)
         nh = icon.get("naturalHeight", 0) or icon.get("viewBoxHeight", 0)
 
         if nw > 0 and nh > 0:
             intrinsic_ratio = nw / nh
 
-            # Round to 2 decimal places to ignore sub-pixel rendering
-            # (e.g. 1.001 vs 1.000 are visually identical)
             if round(intrinsic_ratio, 2) == round(rendered_ratio, 2):
                 passed.append({
                     **icon,
@@ -1680,7 +2459,6 @@ async def check_f1_09(page, url: str) -> list:
                     "reason_pass":     "Ratios match"
                 })
             else:
-                # Determine if compressed or stretched
                 if rendered_ratio > intrinsic_ratio:
                     deformation = "stretched horizontally / compressed vertically"
                 else:
@@ -1694,289 +2472,43 @@ async def check_f1_09(page, url: str) -> list:
                 })
             continue
 
-        # No size info — cannot determine, treat as pass (don't punish unknown)
+        # No size info — cannot determine, treat as pass
         passed.append({
             **icon,
             "reason_pass": "No intrinsic size available (cannot verify, assumed OK)"
         })
 
-    # ═══════════════════════════════════════════════════════════════
-    # BUILD RESULTS
-    # ═══════════════════════════════════════════════════════════════
+    # BUILD RESULTS - UNIQUE annotated screenshot per violation
     if violations:
-        evidence = await capture_page_screenshot(
-            page, "F1_09", "aspect_ratio_violation"
-        )
-
-        for v in violations[:10]:
-            tag             = v.get("tag", "").upper()
+        for i, v in enumerate(violations[:10], start=1):
+            tag = v.get("tag", "").upper()
             intrinsic_ratio = v.get("intrinsic_ratio", "?")
-            rendered_ratio  = v.get("rendered_ratio",  "?")
-            deformation     = v.get("deformation",     "")
-            nw  = v.get("naturalWidth",  0) or v.get("viewBoxWidth",  0)
-            nh  = v.get("naturalHeight", 0) or v.get("viewBoxHeight", 0)
-            rw  = v.get("renderedWidth",  0)
-            rh  = v.get("renderedHeight", 0)
+            rendered_ratio = v.get("rendered_ratio", "?")
+            deformation = v.get("deformation", "")
+            nw = v.get("naturalWidth", 0) or v.get("viewBoxWidth", 0)
+            nh = v.get("naturalHeight", 0) or v.get("viewBoxHeight", 0)
+            rw = v.get("renderedWidth", 0)
+            rh = v.get("renderedHeight", 0)
             src = v.get("src", "N/A")
-            css_w = v.get("cssWidth",  "")
+            css_w = v.get("cssWidth", "")
             css_h = v.get("cssHeight", "")
             obj_fit = v.get("objectFit", "fill")
 
-            reason = (
-                f"{tag} proportion NOT retained — icon is {deformation}. "
-                f"Original: {nw}x{nh} (ratio {intrinsic_ratio}) | "
-                f"Rendered: {rw}x{rh}px (ratio {rendered_ratio}). "
-                f"CSS: width={css_w}, height={css_h}, object-fit={obj_fit}. "
-                f"Source: {src}"
-            )
-
-            results.append({
-                "requirement": "F1-09",
-                "name":        "Icon Aspect Ratio",
-                "status":      "FAIL",
-                "reason":      reason,
-                "actual":      f"Original {intrinsic_ratio} → Rendered {rendered_ratio}",
-                "expected":    "Original ratio = Rendered ratio (proportion retained)",
-                "evidence":    evidence,
-            })
-
-    else:
-        evidence = await capture_page_screenshot(
-            page, "F1_09", "aspect_ratio_pass"
-        )
-        results.append({
-            "requirement": "F1-09",
-            "name":        "Icon Aspect Ratio",
-            "status":      "PASS",
-            "reason":      (
-                f"All {len(passed)} icons retain correct proportion. "
-                f"No compression or stretching detected."
-            ),
-            "actual":      f"{len(passed)} icons checked, all proportions retained",
-            "expected":    "Icon proportion retained (not compressed or stretched).",
-            "evidence":    evidence,
-        })
-
-    # ---- Console summary ----
-    print(f"\n  [F1-09] Total checked : {len(passed) + len(violations)}")
-    print(f"  [F1-09] Passed        : {len(passed)}")
-    print(f"  [F1-09] Failed        : {len(violations)}")
-    print(f"  [F1-09] Result        : {'FAIL' if violations else 'PASS'}")
-
-    if violations:
-        print(f"\n  [F1-09] FAILED ICONS:")
-        for v in violations:
-            nw = v.get("naturalWidth",  0) or v.get("viewBoxWidth",  0)
-            nh = v.get("naturalHeight", 0) or v.get("viewBoxHeight", 0)
-            print(
-                f"    ❌ {v.get('src', 'N/A')}\n"
-                f"       Original  : {nw}x{nh} "
-                f"(ratio {v.get('intrinsic_ratio')})\n"
-                f"       Rendered  : {v.get('renderedWidth')}x{v.get('renderedHeight')} "
-                f"(ratio {v.get('rendered_ratio')})\n"
-                f"       Status    : {v.get('deformation')}"
-            )
-
-    return results# =========================================================
-# F1-09: ICON ASPECT RATIO
-# Manual Requirement:
-#   "The correct proportion of icon is retained and icon
-#    is not compressed or stretched"
-#
-# Logic (binary - matches manual exactly):
-#   PASS = proportion retained (not compressed/stretched)
-#   FAIL = proportion not retained (compressed/stretched)
-#
-# An icon's proportion IS RETAINED if ANY of these is true:
-#   1. object-fit: contain / cover / scale-down / none
-#      (browser preserves aspect ratio automatically)
-#   2. SVG without preserveAspectRatio="none"
-#      (SVG default behavior preserves aspect ratio)
-#   3. Rendered ratio matches intrinsic ratio
-#      (rounded to 2 decimal places to ignore sub-pixel rendering)
-# =========================================================
-
-async def check_f1_09(page, url: str) -> list:
-    results = []
-
-    try:
-        icon_data = await page.evaluate(
-            """
-            () => {
-                const icons = [];
-
-                document.querySelectorAll('img, svg').forEach(el => {
-                    try {
-                        const rect = el.getBoundingClientRect();
-
-                        // Skip invisible
-                        if (rect.width < 8 || rect.height < 8) return;
-                        if (rect.width > 500 || rect.height > 500) return;
-
-                        const style = window.getComputedStyle(el);
-                        if (style.display === 'none')      return;
-                        if (style.visibility === 'hidden') return;
-                        if (style.opacity === '0')         return;
-
-                        const objectFit = (style.objectFit || 'fill').toLowerCase();
-
-                        // SVG viewBox + preserveAspectRatio
-                        let vbWidth = 0, vbHeight = 0;
-                        let svgPreserveAR = '';
-                        if (el.tagName.toLowerCase() === 'svg') {
-                            const vb = el.getAttribute('viewBox');
-                            if (vb) {
-                                const parts = vb.trim().split(/[ \t,]+/);
-                                if (parts.length >= 4) {
-                                    vbWidth  = parseFloat(parts[2]);
-                                    vbHeight = parseFloat(parts[3]);
-                                }
-                            }
-                            svgPreserveAR = el.getAttribute('preserveAspectRatio') || '';
-                        }
-
-                        icons.push({
-                            tag:            el.tagName.toLowerCase(),
-                            src:            el.src || el.getAttribute('href') || '',
-                            alt:            el.getAttribute('alt') || '',
-                            renderedWidth:  Math.round(rect.width),
-                            renderedHeight: Math.round(rect.height),
-                            naturalWidth:   el.naturalWidth  || 0,
-                            naturalHeight:  el.naturalHeight || 0,
-                            viewBoxWidth:   vbWidth,
-                            viewBoxHeight:  vbHeight,
-                            objectFit:      objectFit,
-                            svgPreserveAR:  svgPreserveAR,
-                            cssWidth:       style.width  || '',
-                            cssHeight:      style.height || '',
-                        });
-                    } catch(e) {}
-                });
-
-                return icons;
+            rect_data = {
+                "x": v.get("x", 0),
+                "y": v.get("y", 0),
+                "width": rw,
+                "height": rh,
             }
-            """
-        )
-    except Exception as e:
-        print(f"  [F1-09] JavaScript evaluation failed: {e}")
-        icon_data = []
 
-    if not icon_data:
-        evidence = await capture_page_screenshot(page, "F1_09", "no_icons")
-        return [{
-            "requirement": "F1-09",
-            "name":        "Icon Aspect Ratio",
-            "status":      "PASS",
-            "reason":      "No icons detected on the page.",
-            "actual":      "N/A",
-            "expected":    "Icon proportion retained (not compressed or stretched).",
-            "evidence":    evidence,
-        }]
-
-    violations = []
-    passed     = []
-    seen_srcs  = set()
-
-    for icon in icon_data:
-        rw = icon.get("renderedWidth",  0)
-        rh = icon.get("renderedHeight", 0)
-        if rw <= 0 or rh <= 0:
-            continue
-
-        src        = icon.get("src", "").strip()
-        object_fit = icon.get("objectFit", "fill")
-        tag        = icon.get("tag", "")
-
-        if src and src in seen_srcs:
-            continue
-        if src:
-            seen_srcs.add(src)
-
-        rendered_ratio = rw / rh
-
-        # ═══════════════════════════════════════════════════════════
-        # RULE 1: object-fit guarantees proportion is retained
-        # ═══════════════════════════════════════════════════════════
-        if object_fit in ("contain", "cover", "scale-down", "none"):
-            passed.append({
-                **icon,
-                "reason_pass": f"object-fit: {object_fit} preserves proportion"
-            })
-            continue
-
-        # ═══════════════════════════════════════════════════════════
-        # RULE 2: SVG default behavior preserves aspect ratio
-        # (unless preserveAspectRatio="none" is explicitly set)
-        # ═══════════════════════════════════════════════════════════
-        if tag == "svg":
-            svg_par = icon.get("svgPreserveAR", "").strip().lower()
-            if svg_par != "none":
-                passed.append({
-                    **icon,
-                    "reason_pass": "SVG default preserveAspectRatio preserves proportion"
-                })
-                continue
-
-        # ═══════════════════════════════════════════════════════════
-        # RULE 3: Compare intrinsic vs rendered ratio
-        # ═══════════════════════════════════════════════════════════
-        nw = icon.get("naturalWidth",  0) or icon.get("viewBoxWidth",  0)
-        nh = icon.get("naturalHeight", 0) or icon.get("viewBoxHeight", 0)
-
-        if nw > 0 and nh > 0:
-            intrinsic_ratio = nw / nh
-
-            # Round to 2 decimal places to ignore sub-pixel rendering
-            # (e.g. 1.001 vs 1.000 are visually identical)
-            if round(intrinsic_ratio, 2) == round(rendered_ratio, 2):
-                passed.append({
-                    **icon,
-                    "intrinsic_ratio": round(intrinsic_ratio, 2),
-                    "rendered_ratio":  round(rendered_ratio,  2),
-                    "reason_pass":     "Ratios match"
-                })
-            else:
-                # Determine if compressed or stretched
-                if rendered_ratio > intrinsic_ratio:
-                    deformation = "stretched horizontally / compressed vertically"
-                else:
-                    deformation = "compressed horizontally / stretched vertically"
-
-                violations.append({
-                    **icon,
-                    "intrinsic_ratio": round(intrinsic_ratio, 2),
-                    "rendered_ratio":  round(rendered_ratio,  2),
-                    "deformation":     deformation,
-                })
-            continue
-
-        # No size info — cannot determine, treat as pass (don't punish unknown)
-        passed.append({
-            **icon,
-            "reason_pass": "No intrinsic size available (cannot verify, assumed OK)"
-        })
-
-    # ═══════════════════════════════════════════════════════════════
-    # BUILD RESULTS
-    # ═══════════════════════════════════════════════════════════════
-    if violations:
-        evidence = await capture_page_screenshot(
-            page, "F1_09", "aspect_ratio_violation"
-        )
-
-        for v in violations[:10]:
-            tag             = v.get("tag", "").upper()
-            intrinsic_ratio = v.get("intrinsic_ratio", "?")
-            rendered_ratio  = v.get("rendered_ratio",  "?")
-            deformation     = v.get("deformation",     "")
-            nw  = v.get("naturalWidth",  0) or v.get("viewBoxWidth",  0)
-            nh  = v.get("naturalHeight", 0) or v.get("viewBoxHeight", 0)
-            rw  = v.get("renderedWidth",  0)
-            rh  = v.get("renderedHeight", 0)
-            src = v.get("src", "N/A")
-            css_w = v.get("cssWidth",  "")
-            css_h = v.get("cssHeight", "")
-            obj_fit = v.get("objectFit", "fill")
+            # Capture UNIQUE annotated screenshot for THIS violation
+            evidence = await capture_annotated_screenshot(
+                page,
+                "F1_09",
+                f"aspect_ratio_violation_{i}",
+                rect=rect_data,
+                note=f"Ratio mismatch: {rendered_ratio} vs {intrinsic_ratio}"
+            )
 
             reason = (
                 f"{tag} proportion NOT retained — icon is {deformation}. "
@@ -2013,25 +2545,10 @@ async def check_f1_09(page, url: str) -> list:
             "evidence":    evidence,
         })
 
-    # ---- Console summary ----
     print(f"\n  [F1-09] Total checked : {len(passed) + len(violations)}")
     print(f"  [F1-09] Passed        : {len(passed)}")
     print(f"  [F1-09] Failed        : {len(violations)}")
     print(f"  [F1-09] Result        : {'FAIL' if violations else 'PASS'}")
-
-    if violations:
-        print(f"\n  [F1-09] FAILED ICONS:")
-        for v in violations:
-            nw = v.get("naturalWidth",  0) or v.get("viewBoxWidth",  0)
-            nh = v.get("naturalHeight", 0) or v.get("viewBoxHeight", 0)
-            print(
-                f"    ❌ {v.get('src', 'N/A')}\n"
-                f"       Original  : {nw}x{nh} "
-                f"(ratio {v.get('intrinsic_ratio')})\n"
-                f"       Rendered  : {v.get('renderedWidth')}x{v.get('renderedHeight')} "
-                f"(ratio {v.get('rendered_ratio')})\n"
-                f"       Status    : {v.get('deformation')}"
-            )
 
     return results
 
@@ -2059,7 +2576,7 @@ async def check_f1_10(page, url: str) -> list:
                         iconColor: style.color || style.fill || "#000000",
                         containerBg: contStyle.backgroundColor || contStyle.background || "#FFFFFF",
                         containerBgImage: contStyle.backgroundImage || "",
-                        rect: { x: rect.x, y: rect.y, w: rect.width, h: rect.height }
+                        rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height }
                     });
                 });
             });
@@ -2080,7 +2597,7 @@ async def check_f1_10(page, url: str) -> list:
             "evidence": evidence,
         }]
 
-    for idx, item in enumerate(overlay_icons[:20]):
+    for idx, item in enumerate(overlay_icons[:20], start=1):
         fg_raw = normalize_hex(item.get("iconColor", ""))
         bg_raw = normalize_hex(item.get("containerBg", ""))
         has_bg_img = "url(" in item.get("containerBgImage", "")
@@ -2095,9 +2612,22 @@ async def check_f1_10(page, url: str) -> list:
         except Exception:
             ratio = 0.0
 
-        evidence = await capture_page_screenshot(page, "F1_10", f"icon_contrast_{idx}")
+        # Capture UNIQUE annotated screenshot for THIS icon
+        icon_rect = item.get("rect", {})
+        rect_data = {
+            "x": icon_rect.get("x", 0),
+            "y": icon_rect.get("y", 0),
+            "width": icon_rect.get("width", icon_rect.get("w", 0)),
+            "height": icon_rect.get("height", icon_rect.get("h", 0)),
+        }
 
-        if ratio < 4.5:
+        if ratio < CONFIG.MIN_CONTRAST_RATIO:
+            note = f"Low contrast: {ratio:.2f}:1 (need 4.5:1)"
+            evidence = await capture_annotated_screenshot(
+                page, "F1_10", f"contrast_fail_{idx}",
+                rect=rect_data,
+                note=note
+            )
             results.append({
                 "requirement": "F1-10",
                 "name": "Icon Contrast on Images",
@@ -2108,6 +2638,12 @@ async def check_f1_10(page, url: str) -> list:
                 "evidence": evidence,
             })
         else:
+            note = f"Contrast OK: {ratio:.2f}:1"
+            evidence = await capture_annotated_screenshot(
+                page, "F1_10", f"contrast_pass_{idx}",
+                rect=rect_data,
+                note=note
+            )
             results.append({
                 "requirement": "F1-10",
                 "name": "Icon Contrast on Images",
@@ -2137,34 +2673,61 @@ async def check_f1_10(page, url: str) -> list:
 # =========================================================
 
 def score_results(all_results: list) -> dict:
-    total = len(all_results)
-    passed = sum(1 for r in all_results if r.get("status") == "PASS")
+    """Score results with proper handling of WARN and ERROR statuses."""
+    countable = [r for r in all_results if r.get("status") in ("PASS", "FAIL")]
+    total  = len(countable)
+    passed = sum(1 for r in countable if r["status"] == "PASS")
     failed = total - passed
+    warns  = sum(1 for r in all_results if r.get("status") == "WARN")
+    errors = sum(1 for r in all_results if r.get("status") == "ERROR")
+
     pct = round((passed / total * 100) if total > 0 else 0, 1)
 
-    if pct >= 90:
-        grade = "A"
-    elif pct >= 75:
-        grade = "B"
-    elif pct >= 60:
-        grade = "C"
-    elif pct >= 40:
-        grade = "D"
-    else:
-        grade = "F"
+    grade_thresholds = [(90, "A"), (75, "B"), (60, "C"), (40, "D")]
+    grade = next((g for threshold, g in grade_thresholds if pct >= threshold), "F")
 
     return {
         "overall_compliance_pct": pct,
         "total_checks": total,
         "passed": passed,
         "failed": failed,
+        "warnings": warns,
+        "errors": errors,
         "grade": grade,
         "status": "COMPLIANT" if pct >= 75 else "NON_COMPLIANT",
     }
 
 # =========================================================
-# REPORT GENERATION - DOCX ONLY (FIXED LAYOUT)
+# REPORT GENERATION - DOCX ONLY
 # =========================================================
+
+def check_node_dependencies() -> tuple:
+    """Verify Node.js and docx package are available."""
+    try:
+        result = subprocess.run(
+            ["node", "--version"],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode != 0:
+            return False, "Node.js not found. Install from https://nodejs.org"
+        node_version = result.stdout.strip()
+    except FileNotFoundError:
+        return False, "Node.js not found in PATH. Install from https://nodejs.org"
+
+    check_script = "try{require('docx');console.log('OK')}catch(e){console.error(e.message)}"
+    result = subprocess.run(
+        ["node", "-e", check_script],
+        capture_output=True, text=True, timeout=10
+    )
+    if "OK" not in result.stdout:
+        return False, (
+            f"Node.js {node_version} found, but 'docx' package missing.\n"
+            f"Fix: npm install docx\n"
+            f"Error: {result.stderr.strip()}"
+        )
+
+    return True, f"Node.js {node_version} with docx package: OK"
+
 
 def save_docx_report(all_results: list, summary: dict, url: str) -> Path:
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -2175,7 +2738,9 @@ def save_docx_report(all_results: list, summary: dict, url: str) -> Path:
         encoding="utf-8",
     )
 
-    out_path = (REPORTS_DIR / "report.docx").resolve()
+    final_path = (REPORTS_DIR / "report.docx").resolve()
+    # Write to a temporary file first to avoid EBUSY when report.docx is open in Word
+    tmp_out_path = (REPORTS_DIR / f"_report_tmp_{int(time.time())}.docx").resolve()
 
     node_script = r"""
 "use strict";
@@ -2204,16 +2769,14 @@ const LGRAY  = "F2F2F2";
 const MGRAY  = "CCCCCC";
 const DKGRAY = "555555";
 
-// PORTRAIT dimensions (cover, summary, req-wise)
 const PORTRAIT_W  = 12240;
 const PORTRAIT_H  = 15840;
 const MARGIN      = 1080;
-const PORTRAIT_CW = PORTRAIT_W - MARGIN * 2;   // 10,080 twips
+const PORTRAIT_CW = PORTRAIT_W - MARGIN * 2;
 
-// LANDSCAPE dimensions (detail table + screenshots)
 const LANDSCAPE_W  = 15840;
 const LANDSCAPE_H  = 12240;
-const LANDSCAPE_CW = LANDSCAPE_W - MARGIN * 2; // 13,680 twips
+const LANDSCAPE_CW = LANDSCAPE_W - MARGIN * 2;
 
 function cell(text, widthDxa, opts = {}) {
   const {
@@ -2263,7 +2826,6 @@ function para(text, opts = {}) {
 const GRADE_COLOR = { A: GREEN, B: "5279D7", C: AMBER, D: "916100", F: RED };
 const gradeColor = GRADE_COLOR[summary.grade] || DKGRAY;
 
-// Summary Table (portrait: target sum 9,600 with slack)
 function summaryTable() {
   const cols  = [1600, 1600, 1600, 1600, 1600, 1600];
   const labels = ["Grade", "Compliance %", "Total Checks", "Passed", "Failed", "Status"];
@@ -2291,7 +2853,6 @@ function summaryTable() {
   });
 }
 
-// Req-Wise Summary Table (portrait)
 function reqSummaryTable() {
   const byReq = {};
   results.forEach(r => {
@@ -2327,9 +2888,7 @@ function reqSummaryTable() {
   return new Table({ width: { size: 9600, type: WidthType.DXA }, columnWidths: cols, rows });
 }
 
-// Detail Table (LANDSCAPE: 13,680 twips - target sum 13,200 with slack)
 function detailTable() {
-  // Req  Name  Status Reason Actual Expected
   const cols = [1000, 2200, 900, 4200, 2300, 2600];
 
   const headerRow = new TableRow({
@@ -2376,52 +2935,64 @@ function screenshotSection() {
     spacer(40),
   ];
 
-  const evidenceItems = results.filter(r => r.evidence && fs.existsSync(r.evidence));
+  const evidenceByReq = {};
+  results.forEach(r => {
+    if (r.evidence && fs.existsSync(r.evidence)) {
+      if (!evidenceByReq[r.requirement]) {
+        evidenceByReq[r.requirement] = [];
+      }
+      evidenceByReq[r.requirement].push(r);
+    }
+  });
 
-  if (evidenceItems.length === 0) {
+  const totalScreenshots = Object.values(evidenceByReq).reduce((sum, arr) => sum + arr.length, 0);
+  
+  if (totalScreenshots === 0) {
     children.push(para("No evidence screenshots available.", { color: DKGRAY }));
     return children;
   }
 
-  evidenceItems.slice(0, 30).forEach(r => {
-    try {
-      const imgBuf  = fs.readFileSync(r.evidence);
-      const isPass  = r.status === "PASS";
+  Object.keys(evidenceByReq).sort().forEach(reqId => {
+    const items = evidenceByReq[reqId];
+    
+    items.slice(0, 10).forEach(r => {
+      try {
+        const imgBuf  = fs.readFileSync(r.evidence);
+        const isPass  = r.status === "PASS";
 
-      children.push(new Paragraph({
-        children: [
-          new TextRun({ text: `${r.requirement}  `, bold: true, font: "Arial", size: 20 }),
-          new TextRun({ text: r.name + "  ", font: "Arial", size: 20 }),
-          new TextRun({
-            text: r.status,
-            bold: true,
-            color: isPass ? GREEN : RED,
-            font: "Arial",
-            size: 20,
-          }),
-        ],
-      }));
-      children.push(para(r.reason, { color: DKGRAY, size: 18 }));
-      children.push(spacer(20));
+        children.push(new Paragraph({
+          children: [
+            new TextRun({ text: `${r.requirement} - ${r.name}  `, bold: true, font: "Arial", size: 20 }),
+            new TextRun({
+              text: r.status,
+              bold: true,
+              color: isPass ? GREEN : RED,
+              font: "Arial",
+              size: 20,
+            }),
+          ],
+        }));
+        children.push(para(r.reason.substring(0, 200), { color: DKGRAY, size: 18 }));
+        children.push(spacer(20));
 
-      children.push(new Paragraph({
-        children: [
-          new ImageRun({
-            type: "png",
-            data: imgBuf,
-            transformation: { width: 600, height: 338 },
-            altText: { title: r.requirement, description: r.reason, name: r.requirement },
-          }),
-        ],
-      }));
-      children.push(spacer(60));
-    } catch (_) {}
+        children.push(new Paragraph({
+          children: [
+            new ImageRun({
+              type: "png",
+              data: imgBuf,
+              transformation: { width: 600, height: 338 },
+              altText: { title: r.requirement, description: r.reason.substring(0, 100), name: r.requirement },
+            }),
+          ],
+        }));
+        children.push(spacer(60));
+      } catch (_) {}
+    });
   });
 
   return children;
 }
 
-// Reusable header/footer factories
 function makeHeader(contentW) {
   return new Header({
     children: [new Paragraph({
@@ -2469,8 +3040,6 @@ const doc = new Document({
   },
   numbering: { config: [] },
   sections: [
-
-    // SECTION 1 — PORTRAIT (cover, exec summary, req-wise summary)
     {
       properties: {
         page: {
@@ -2514,7 +3083,9 @@ const doc = new Document({
         para(
           `Overall compliance score: ${summary.overall_compliance_pct}%  ` +
           `(${summary.passed} of ${summary.total_checks} checks passed).  ` +
-          `Final grade: ${summary.grade}  |  Status: ${summary.status}`,
+          `Final grade: ${summary.grade}  |  Status: ${summary.status}` +
+          (summary.warnings > 0 ? `  |  Warnings: ${summary.warnings}` : "") +
+          (summary.errors > 0 ? `  |  Errors: ${summary.errors}` : ""),
           { size: 20 }
         ),
         spacer(40),
@@ -2527,8 +3098,6 @@ const doc = new Document({
         reqSummaryTable(),
       ],
     },
-
-    // SECTION 2 — LANDSCAPE (detail table + screenshots)
     {
       properties: {
         page: {
@@ -2547,7 +3116,6 @@ const doc = new Document({
         ...screenshotSection(),
       ],
     },
-
   ],
 });
 
@@ -2576,23 +3144,50 @@ Packer.toBuffer(doc).then(buf => {
     else:
         node_cwd = Path.cwd()
 
+    actual_output_path = final_path
     try:
+        # Step 1: Generate DOCX to a temporary path (always succeeds)
         result = subprocess.run(
-            ["node", str(tmp_js), str(tmp_json.resolve()), str(out_path)],
+            ["node", str(tmp_js), str(tmp_json.resolve()), str(tmp_out_path)],
             capture_output=True, text=True, timeout=120,
             cwd=str(node_cwd),
         )
         if result.returncode != 0 or "ERROR:" in result.stdout:
             err_msg = result.stderr or result.stdout
             raise RuntimeError(f"Node.js docx generation failed:\n{err_msg}")
-        print(f"  DOCX report: {out_path}")
+
+        # Step 2: Try to atomically replace report.docx with the new file
+        try:
+            os.replace(str(tmp_out_path), str(final_path))
+            actual_output_path = final_path
+            print(f"  DOCX report: {final_path}")
+        except (PermissionError, OSError) as lock_err:
+            # report.docx is locked (likely open in Word) — save to timestamped fallback
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            fallback_path = (REPORTS_DIR / f"report_{timestamp}.docx").resolve()
+            try:
+                os.replace(str(tmp_out_path), str(fallback_path))
+                actual_output_path = fallback_path
+                print(f"  ⚠️  '{final_path.name}' is currently open/locked.")
+                print(f"  DOCX report saved as: {fallback_path}")
+                print(f"  Close MS Word and re-run to overwrite '{final_path.name}'.")
+            except Exception as fb_err:
+                raise RuntimeError(
+                    f"Could not write DOCX. '{final_path.name}' is locked "
+                    f"(close MS Word) and fallback also failed: {fb_err}"
+                )
+
     finally:
         try: tmp_js.unlink(missing_ok=True)
         except Exception: pass
         try: tmp_json.unlink(missing_ok=True)
         except Exception: pass
+        try:
+            if tmp_out_path.exists():
+                tmp_out_path.unlink(missing_ok=True)
+        except Exception: pass
 
-    return out_path
+    return actual_output_path
 
 # =========================================================
 # URL VALIDATION
@@ -2605,6 +3200,11 @@ def prepare_url(raw: str) -> str:
     parsed = urlparse(raw)
     if not parsed.netloc:
         raise ValueError(f"Invalid URL: {raw}")
+    
+    safe, reason = is_safe_url(raw)
+    if not safe:
+        raise ValueError(f"URL rejected for security reasons: {reason}")
+    
     return raw
 
 
@@ -2719,7 +3319,15 @@ async def run_engine(url: str):
     print(f"  Target: {url}")
     print(f"{'='*65}\n")
 
-    print("[1/5] Launching browser with anti-detection measures...")
+    print("[1/5] Pre-flight checks...")
+    node_ok, node_msg = check_node_dependencies()
+    if not node_ok:
+        print(f"  WARNING: {node_msg}")
+        print("  DOCX report generation may fail. Continuing...")
+    else:
+        print(f"  {node_msg}")
+    
+    print("[2/5] Launching browser with anti-detection measures...")
     all_results = []
 
     async with async_playwright() as p:
@@ -2733,118 +3341,124 @@ async def run_engine(url: str):
                 "--disable-web-security",
             ],
         )
-        context = await create_stealth_context(browser)
-        page = await context.new_page()
-
-        response = None
+        
         try:
-            response = await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-        except Exception as e:
-            print(f"  Initial load error: {e}")
+            context = await create_stealth_context(browser)
+            page = await context.new_page()
 
-        await page.wait_for_timeout(5000)
-        final_url = page.url
-        status = response.status if response else None
+            response = None
+            try:
+                response = await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            except Exception as e:
+                print(f"  Initial load error: {e}")
 
-        blocked, block_reason = await detect_block(page, status, final_url)
-        if blocked:
-            print(f"\n⚠️  WARNING: Website is blocking automated access!")
-            print(f"   Reason: {block_reason}")
-            print(f"   URL: {final_url}")
-            print(f"   Cannot perform compliance audit.\n")
-            (SCREENSHOTS_DIR / "F1_00").mkdir(parents=True, exist_ok=True)
-            screenshot_path = SCREENSHOTS_DIR / "F1_00" / "access_denied.png"
-            await page.screenshot(path=str(screenshot_path))
-            print(f"   Screenshot saved: {screenshot_path}")
-            await browser.close()
-            return {
-                "summary": {"status": "BLOCKED", "reason": block_reason},
-                "results": []
-            }
+            await page.wait_for_timeout(5000)
+            final_url = page.url
+            status = response.status if response else None
 
-        print("[2/5] Extracting rendered styles and colours...")
-
-        try:
-            await page.evaluate(
-                """
-                async () => {
-                    for (let i = 0; i < 6; i++) {
-                        window.scrollBy(0, window.innerHeight);
-                        await new Promise(r => setTimeout(r, 300));
-                    }
-                    window.scrollTo(0, 0);
+            blocked, block_reason = await detect_block(page, status, final_url)
+            if blocked:
+                print(f"\n⚠️  WARNING: Website is blocking automated access!")
+                print(f"   Reason: {block_reason}")
+                print(f"   URL: {final_url}")
+                print(f"   Cannot perform compliance audit.\n")
+                (SCREENSHOTS_DIR / "F1_00").mkdir(parents=True, exist_ok=True)
+                screenshot_path = SCREENSHOTS_DIR / "F1_00" / "access_denied.png"
+                await page.screenshot(path=str(screenshot_path))
+                print(f"   Screenshot saved: {screenshot_path}")
+                return {
+                    "summary": {"status": "BLOCKED", "reason": block_reason},
+                    "results": []
                 }
-                """
-            )
-            await page.wait_for_timeout(2000)
-        except Exception as e:
-            print(f"  Scroll interrupted (page navigated): {e}")
-            await page.wait_for_timeout(3000)
 
-        try:
-            await page.wait_for_load_state("domcontentloaded", timeout=10000)
-        except Exception:
-            pass
+            print("[3/5] Extracting rendered styles and colours...")
 
-        try:
-            elements = await extract_rendered_styles(page)
-            colours = extract_colours_from_elements(elements)
-        except Exception as e:
-            print(f"  Style extraction failed: {e}")
-            elements = []
-            colours = []
+            try:
+                await page.evaluate(
+                    """
+                    async () => {
+                        for (let i = 0; i < 6; i++) {
+                            window.scrollBy(0, window.innerHeight);
+                            await new Promise(r => setTimeout(r, 300));
+                        }
+                        window.scrollTo(0, 0);
+                    }
+                    """
+                )
+                await page.wait_for_timeout(2000)
+            except Exception as e:
+                print(f"  Scroll interrupted (page navigated): {e}")
+                await page.wait_for_timeout(3000)
 
-        print("[3/5] Detecting dominant colour group...")
-        dominant_result = detect_dominant_group(colours)
-        print(f"  Dominant group: {dominant_result['dominant_group']} (confidence: {dominant_result['confidence']:.1%})")
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=10000)
+            except Exception:
+                pass
 
-        print("[4/5] Running F1-01 through F1-10 checks...")
+            try:
+                elements = await extract_rendered_styles(page)
+                colours = extract_colours_from_elements(elements)
+            except Exception as e:
+                print(f"  Style extraction failed: {e}")
+                elements = []
+                colours = []
 
-        print("  F1-01: Primary Colour Palette")
-        r01 = await check_f1_01(page, url, colours, dominant_result)
-        all_results.append(r01)
+            print("[4/5] Detecting dominant colour group...")
+            dominant_result = detect_dominant_group(colours)
+            print(f"  Dominant group: {dominant_result['dominant_group']} (confidence: {dominant_result['confidence']:.1%})")
 
-        print("  F1-02: Functional Colour Palette")
-        r02 = await check_f1_02(page, url, colours)
-        all_results.extend(r02)
+            print("[5/5] Running F1-01 through F1-10 checks...")
 
-        print("  F1-03: Icon Colours")
-        r03 = await check_f1_03(page, url, dominant_result)
-        all_results.extend(r03)
+            print("  F1-01: Primary Colour Palette")
+            r01 = await check_f1_01(page, url, colours, dominant_result)
+            all_results.append(r01)
 
-        print("  F1-04: Footer Background Colour")
-        r04 = await check_f1_04(page, url, dominant_result)
-        all_results.append(r04)
+            print("  F1-02: Functional Colour Palette")
+            r02 = await check_f1_02(page, url, colours)
+            all_results.extend(r02)
 
-        print("  F1-05: Consistent Icon Style")
-        r05 = await check_f1_05(page, url)
-        all_results.append(r05)
+            print("  F1-03: Icon Colours")
+            r03 = await check_f1_03(page, url, dominant_result)
+            all_results.extend(r03)
 
-        print("  F1-06: DBIM Icon Set Usage")
-        r06 = await check_f1_06(page, url)
-        all_results.append(r06)
+            print("  F1-04: Footer Background Colour")
+            r04 = await check_f1_04(page, url, dominant_result)
+            all_results.append(r04)
 
-        print("  F1-07: Icon File Format")
-        r07 = await check_f1_07(page, url)
-        all_results.extend(r07)
+            print("  F1-05: Consistent Icon Style")
+            r05 = await check_f1_05(page, url)
+            all_results.append(r05)
 
-        print("  F1-08: Icon Size")
-        r08 = await check_f1_08(page, url)
-        all_results.extend(r08)
+            print("  F1-06: DBIM Icon Set Usage")
+            r06 = await check_f1_06(page, url)
+            all_results.append(r06)
 
-        print("  F1-09: Icon Aspect Ratio")
-        r09 = await check_f1_09(page, url)
-        all_results.extend(r09)
+            print("  F1-07: Icon File Format")
+            r07 = await check_f1_07(page, url)
+            all_results.extend(r07)
 
-        print("  F1-10: Icon Contrast on Images")
-        r10 = await check_f1_10(page, url)
-        all_results.extend(r10)
+            print("  F1-08: Icon Size")
+            r08 = await check_f1_08(page, url)
+            all_results.extend(r08)
 
-        await browser.close()
+            print("  F1-09: Icon Aspect Ratio")
+            r09 = await check_f1_09(page, url)
+            all_results.extend(r09)
 
-    print("[5/5] Generating DOCX report...")
+            print("  F1-10: Icon Contrast on Images")
+            r10 = await check_f1_10(page, url)
+            all_results.extend(r10)
+
+        finally:
+            await browser.close()
+
+    print("[6/5] Generating DOCX report...")
     summary = score_results(all_results)
-    save_docx_report(all_results, summary, url)
+    try:
+        save_docx_report(all_results, summary, url)
+    except Exception as e:
+        print(f"  WARNING: DOCX report generation failed: {e}")
+        print(f"  JSON audit data saved to reports/ directory for manual inspection.")
 
     print(f"\n{'='*65}")
     print(f"  COMPLIANCE SUMMARY")
@@ -2854,6 +3468,8 @@ async def run_engine(url: str):
     print(f"  Total Checks:   {summary['total_checks']}")
     print(f"  Passed:         {summary['passed']}")
     print(f"  Failed:         {summary['failed']}")
+    print(f"  Warnings:       {summary['warnings']}")
+    print(f"  Errors:         {summary['errors']}")
     print(f"  Status:         {summary['status']}")
     print(f"{'='*65}")
     print(f"  Report saved to: {(REPORTS_DIR / 'report.docx').resolve()}")
